@@ -562,7 +562,7 @@ __global__ void hgemm_t_8x8_sliced_k_f16x8_pack_bcf_kernel(half *a, half *b,
   // M = 256, N = 256, K = 128, OFFset 8, 其余参数与模板默认值保持一致
   // block(16, 16)
   // grid(2, 2)
-  // 这里BM(128)和BN(128)表示每个block计算的c中的结果大小是128 * 128
+  // 这里的block tile大小是BM*BN=128*128，thread tile大小是TM*TN=8*8
   // BK表示K维度分块的大小是8
 
   // threads: 128/8 * 128/8 = 256
@@ -588,7 +588,7 @@ __global__ void hgemm_t_8x8_sliced_k_f16x8_pack_bcf_kernel(half *a, half *b,
   // 
   int load_a_smem_m = tid / 2; // [0, 0, 1, 1, ..., 7, 7, .., 127, 127] , /2 表示变化周期为2，每个周期中的值都相等
   // (0b00000000 & 0b00000001) << 2 = 0
-  // (0b00000001 & 0b00000001) << 2 = 4
+  // 里BM(128)和BN(128)表示每个bloc(0b00000001 & 0b00000001) << 2 = 4
   // (0b00000010 & 0b00000001) << 2 = 0
   // (0b00000011 & 0b00000001) << 2 = 4
   int load_a_smem_k = (tid & 1) << 2; // (0,4) // 这里&1表示以load_a_smem_k是一个周期变化的，周期为2。<<2 表示，变化的间隔为4
@@ -867,18 +867,65 @@ B矩阵访问模式总结：
     // 这里是向量化访存，一次性读4个half给r_load_b
     LDST64BITS(r_load_b[0]) = LDST64BITS(b[load_b_gmem_addr]);
 
-    // s_a[8][128] write: 4路 bank conflicts
+    // 这里a的数据从gmem到reg到smem的过程，对应了b站cuda课的sgemm v7的版本，即为了确保相面做外积的时候smem a的数值能通过一个向量化访存直接加载到reg中，这里在将数据从gmem载入到smem时，对数据做了转置
+
+    // s_a[8][128] write: 4路 bank conflicts，这个好理解，可以看到下面的四行语句明显是访问的同一个bank的不同行，所以有四路冲突。但其实bank不仅需要分析每个线程的，还需要分析同一个warp里面的线程访问bank的情况（我这里没有分析）
+    // s_a[8][128+8]: 无bank冲突，cursor是这么分析的：
+    // 每行136个half = 136 × 2字节 = 272字节 = 68个bank位置
+    // s_a[row][col] 的bank编号 = (row × 68 + col) % 32，即：
+    // s_a[k  ][m] = r_load_a[0];  // bank = (k×68 + m) % 32
+    // s_a[k+1][m] = r_load_a[1];  // bank = ((k+1)×68 + m) % 32
+    // s_a[k+2][m] = r_load_a[2];  // bank = ((k+2)×68 + m) % 32  
+    // s_a[k+3][m] = r_load_a[3];  // bank = ((k+3)×68 + m) % 32
+    // 关键观察：68 % 32 = 4，所以：
+    // 第一个访问bank = (k×68 + m) % 32 = (k×4 + m) % 32
+    // 第二个访问bank = ((k+1)×68 + m) % 32 = (k×4 + 4 + m) % 32
+    // 第三个访问bank = ((k+2)×68 + m) % 32 = (k×4 + 8 + m) % 32
+    // 第四个访问bank = ((k+3)×68 + m) % 32 = (k×4 + 12 + m) % 32
+    // 可以看到都是不同的访问bank，所以没有bank冲突
     s_a[load_a_smem_k][load_a_smem_m] = r_load_a[0];
     s_a[load_a_smem_k + 1][load_a_smem_m] = r_load_a[1];
     s_a[load_a_smem_k + 2][load_a_smem_m] = r_load_a[2];
     s_a[load_a_smem_k + 3][load_a_smem_m] = r_load_a[3];
+
+    // WARNING, WARNING, WARNING: 下面的解答来自cursor，有待考证，需要自己后面进行profile看ptx指令来判断下面观点是否正确
+    // 上面说了，a矩阵从gmem到smem，中间多了个reg的步骤时为了做转置，但下面b矩阵的数据从gmem到smem，中间也多了个reg的步骤（b矩阵这里不需要做转置）
+    // 问了下cursor，中间多了个reg的原因是因为，你直接写smem[index]=gmem[index]这种语句时，编译器做编译时得到的ptx指令仍然是先gmem到reg，再从reg到smem
+    // 而且类似于LDST64BITS(smem[index])=LDST64BITS(gmem[index])这种语句时，编译器可能生成4个独立的32位加载，效率较低。
+    // 所以这里直接显式的把gmem数据到smem的过程写为了 gemm->reg->smem 的全向量化访存过程
+
     // s_b[8][128] write: 2路 bank conflicts
+    // bank冲突分析是这样的：
+    // s_b[0][0] → 字节地址 = (0×128 + 0) × 2 = 0   → bank = 0/4 % 32 = 0（除以4是因为一个bank有4个bytes）
+    // s_b[0][1] → 字节地址 = (0×128 + 1) × 2 = 2   → bank = 2/4 % 32 = 0
+    // s_b[0][2] → 字节地址 = (0×128 + 2) × 2 = 4   → bank = 4/4 % 32 = 1  
+    // s_b[0][3] → 字节地址 = (0×128 + 3) × 2 = 6   → bank = 6/4 % 32 = 1
+    // 所以单个线程就是2路的bank冲突，而对于一个warp中的bank分析如下：
+    // 线程0:  LDST64BITS(s_b[0][0])   → s_b[0][0,1,2,3]
+    // 线程1:  LDST64BITS(s_b[0][4])   → s_b[0][4,5,6,7]  
+    // 线程2:  LDST64BITS(s_b[0][8])   → s_b[0][8,9,10,11]
+    // ...
+    // 线程31: LDST64BITS(s_b[0][124]) → s_b[0][124,125,126,127]
+    // 线程0:  s_b[0][0,1,2,3]   → bank [0,0,1,1]
+    // bank的访问情况是，
+    // 线程1:  s_b[0][4,5,6,7]   → bank [2,2,3,3]
+    // 线程2:  s_b[0][8,9,10,11] → bank [4,4,5,5]
+    // ...
+    // 线程15: s_b[0][60,61,62,63] → bank [30,30,31,31]
+    // 线程16: s_b[0][64,65,66,67] → bank [0,0,1,1]    ← 重复!
+    // 线程17: s_b[0][68,69,70,71] → bank [2,2,3,3]    ← 重复!
+    // ...
+    // 线程31: s_b[0][124,125,126,127] → bank [30,30,31,31] ← 重复!
+    // 综上，所以即使是一个warp，也是两路冲突
+    // 对于s_b[8][128+8]的情况可以问cursor结合profile来分析，这里不展开了
     LDST64BITS(s_b[load_b_smem_k][load_b_smem_n]) = LDST64BITS(r_load_b[0]);
 
     __syncthreads();
 
 #pragma unroll
+    // 下面for循环的逻辑就是外积计算gemm的逻辑，具体的可以看b站cuda的sgemm v5的讲解
     for (int tk = 0; tk < BK; tk++) {
+      // 这里关于下面bank冲突分析的注释都是作者分析的
       // bank conflicts analysis, tx/ty 0~15, 0~7 bank 4*8=32 bytes
       // 进入具体线程后，可以认为该线程对应的值都已经固定了，比如tid, tx, ty.
       // 因此对于这个循环的理解，应该按照tk迭代，tid, tx, ty固定为某个值来理解.
@@ -908,7 +955,7 @@ B矩阵访问模式总结：
     }
     __syncthreads();
   }
-
+// 这里是将结果写回C矩阵，讲解可以看b站cuda的sgemm v6
 #pragma unroll
   for (int i = 0; i < TM; i++) {
     int store_c_gmem_m = by * BM + ty * TM + i;

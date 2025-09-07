@@ -33,6 +33,7 @@
 
 template <const int BM = 128, const int BN = 128, const int BK = 16,
           const int TM = 8, const int TN = 8, const int OFFSET = 0>
+// 相比hgemm_t_8x8_sliced_k16_f16x8_pack_dbuf的区别就是，BK从8变为了16
 __global__ void hgemm_t_8x8_sliced_k16_f16x8_pack_dbuf_kernel(half *a, half *b,
                                                               half *c, int M,
                                                               int N, int K) {
