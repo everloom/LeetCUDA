@@ -276,6 +276,25 @@ __global__ void __launch_bounds__(256)
 // https://zhuanlan.zhihu.com/p/555339335
 // 3. __launch_bounds__: avoid error 'too many resources required for launch'
 // reference: https://blog.csdn.net/feng__shuai/article/details/124395023
+// 1、当使用的共享内存超过48KB时，需要使用动态共享内存，即声明一块动态共享内存 extern __shared__ half smem[]。在
+// 调用内核时需要指定动态共享内存的大小，并且smem寻址应该以一维数组的方式进行。
+// 2、提高L2缓存局部性（Thread Block Swizzle），有参考链接 https://zhuanlan.zhihu.com/p/555339335
+// 3、__launch_bounds__ 用于避免'启动所需资源过多'的错误，有相关技术博客参考 https://blog.csdn.net/feng__shuai/article/details/124395023
+
+/**
+下面是stage为2和为3时的时序图，其中的标号0 1 2为smem的index
+
+stage为2时
+时间轴:    T0    T1    T2    T3    T4    T5    T6    T7    T8
+Buffer0:   L0    C0    L0    C0    L0    C0    L0    C0    ...
+Buffer1:         L1    C1    L1    C1    L1    C1    L1    ...
+
+stage为3时
+时间轴:    T0    T1    T2    T3    T4    T5    T6    T7    T8    T9
+Buffer0:   L0          C0    L0          C0    L0          C0    ...
+Buffer1:         L1          C1    L1          C1    L1          ...
+Buffer2:               L2          C2    L2          C2    L2 
+*/
 template <const int WMMA_M = 16, const int WMMA_N = 16, const int WMMA_K = 16,
           const int WMMA_TILE_M = 4, const int WMMA_TILE_N = 2,
           const int WARP_TILE_M = 2, const int WARP_TILE_N = 4,
@@ -299,8 +318,19 @@ __global__ void __launch_bounds__(256)
   // s4: 4*128*(16+8)*2=24KB, 4*16*(128+8)*2=17KB,    ~41KB
   // s5: 5*128*(16+8)*2=30KB, 5*16*(128+8)*2=21.25KB, ~52KB > 48KB
   extern __shared__ half smem[];
+
+//   A矩阵和B矩阵的共享内存布局是这样的：
+// ┌─────────────────────────────────────────────────────────────┐
+// │              A矩阵区域                     │    B矩阵区域    │
+// │  Stage0   Stage1   ...   Stage(K-1)       │                 │
+// ├─────────┬─────────┬─────┬─────────────────┼─────────────────┤
+// │ BM×(BK  │ BM×(BK  │ ... │ BM×(BK+A_PAD)   │ K_STAGE×BK×     │
+// │ +A_PAD) │ +A_PAD) │     │                 │ (BN+B_PAD)      │
+// └─────────┴─────────┴─────┴─────────────────┴─────────────────┘
+// ^                                           ^
+// s_a                                         s_b
   half *s_a = smem;
-  half *s_b = smem + K_STAGE * BM * (BK + A_PAD);
+  half *s_b = smem + K_STAGE * BM * (BK + A_PAD); // 这里加的K_STAGE * BM * (BK + A_PAD)的offset表示为A矩阵预留的smem的空间
   constexpr int s_a_stage_offset = BM * (BK + A_PAD);
   constexpr int s_b_stage_offset = BK * (BN + B_PAD);
 
@@ -1166,6 +1196,12 @@ void hgemm_wmma_m16n16k16_mma4x2_warp2x4_stages_dsmem(torch::Tensor a,
   // ways bank conflicts. so, the best padding policy for s_a and s_b is
   // A_PAD=0/8, B_PAD=16. Thus, improve B_PAD consume 8x~ less smem than A_PAD,
   // 16xB_PAD vs 128xA_PAD.
+  // s_a 在warp内有4路bank冲突，填充8个元素后 -> 仍然是4路bank冲突。
+  // s_b 在warp内有16路bank冲突，填充8个元素后 -> 8路bank冲突。  
+  // s_b 在warp内有16路bank冲突，填充16个元素后 -> 4路bank冲突。
+  // 因此，s_a和s_b的最佳填充策略是 A_PAD=0/8, B_PAD=16。
+  // 这样，改善B_PAD消耗的共享内存比A_PAD少约8倍，
+  // 16xB_PAD vs 128xA_PAD。
   constexpr int A_PAD = 0;  // 0,8,16
   constexpr int B_PAD = 16; // 0,8,16
   constexpr int NUM_THREADS =
