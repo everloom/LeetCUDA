@@ -1019,6 +1019,16 @@ __global__ void hgemm_t_8x8_sliced_k_f16x8_pack_bcf_dbuf_kernel(
   // Memory做load时，不会影响后续FFMA及其它运算指令的 launch
   // 执行，也就达到了Double Buffering的目的。
 
+  /**
+  说一下我对上面作者的注释的理解，主要是对于第3点的理解
+  注释里面说”主循环中先将下一次循环的gmem数据load到reg，然后再算本次的ffma，之后再将之前load到reg的数据再load到smem，这样可以做到double buffer“
+  首先可以看到的是，for循环里面的逻辑可以分为3个步骤：1、下一个step的数据从gmem->reg(对应LDG指令) 2、本次step的数据的FFMA计算 3、下一个step数据从reg->smem(STG指令)
+  你可能认为，虽然代码是simt的，但在每个thread里面，还是需要顺序执行上面三个步骤，即先要执行完1，才能执行2，最后执行3，所以计算和访存不能overlap
+  但这这里存在这么事实（后面的解释来自cursor），第一个步骤的LDG指令访问的数据，和第二个步骤的FFMA的计算所需要的数据，并不是同一个
+  也即是，FFMA指令并不依赖于LDG指令所load的数据。所以gpu在发射for循环里面的指令的时候，可以同时发射LDG和FFMA指令（应该是编译器发现LDG和FFMA指令在数据上没有依赖，所以编译成ptx之后，可以同时发射这两条）
+  同时GPU里面执行LDG和FFMA也是不同的执行单元Load/Store Units和Arithmetic Units。所以这里可以做到访存和计算的overlap
+  **/
+
   // bk = 0 is loading here, buffer 0
   {
     int load_a_gmem_k = load_a_smem_k;
