@@ -281,20 +281,15 @@ __global__ void __launch_bounds__(256)
 // 2、提高L2缓存局部性（Thread Block Swizzle），有参考链接 https://zhuanlan.zhihu.com/p/555339335
 // 3、__launch_bounds__ 用于避免'启动所需资源过多'的错误，有相关技术博客参考 https://blog.csdn.net/feng__shuai/article/details/124395023
 
-/**
-下面是stage为2和为3时的时序图，其中的标号0 1 2为smem的index
-
-stage为2时
-时间轴:    T0    T1    T2    T3    T4    T5    T6    T7    T8
-Buffer0:   L0    C0    L0    C0    L0    C0    L0    C0    ...
-Buffer1:         L1    C1    L1    C1    L1    C1    L1    ...
-
-stage为3时
-时间轴:    T0    T1    T2    T3    T4    T5    T6    T7    T8    T9
-Buffer0:   L0          C0    L0          C0    L0          C0    ...
-Buffer1:         L1          C1    L1          C1    L1          ...
-Buffer2:               L2          C2    L2          C2    L2 
+/*
+关于使用了cp.async的multistage的gemm讲解，参考reed大佬的博客https://zhuanlan.zhihu.com/p/665082713
+博客里面关于cp.async的multistage的实现的讲解，那个讲解是tile间多级、tile内2级的讲解
+但这里的multistage代码只用到了tile间多级，tile内并没有分级，这个要注意一下
+还有就是博客里面有这么一段话：“这里的stage大小本质是数据加载能力和矩阵计算能力的balance，其由Tile大小和硬件latency决定，在具体
+选择时可以通过micro-benchmark来获取相应的指令的latency来正向设计，也可以通过具体环境试验tuning得到”
+也就是说multistage的stage参数本身是一个超参
 */
+
 template <const int WMMA_M = 16, const int WMMA_N = 16, const int WMMA_K = 16,
           const int WMMA_TILE_M = 4, const int WMMA_TILE_N = 2,
           const int WARP_TILE_M = 2, const int WARP_TILE_N = 4,
@@ -374,6 +369,11 @@ __global__ void __launch_bounds__(256)
   uint32_t smem_a_base_ptr = __cvta_generic_to_shared(s_a);
   uint32_t smem_b_base_ptr = __cvta_generic_to_shared(s_b);
 
+  /*
+  这里说一下为什么预加载K_STAGE-1个gmem的数据
+  参考reed大佬的讲解multistage的博客https://zhuanlan.zhihu.com/p/665082713
+  即在进入tile间循环计算之前，需要将stage-1个异步的gmem到smem的数据加载任务发射出去
+  */
 #pragma unroll
   for (int k = 0; k < (K_STAGE - 1); ++k) { // 0, 1
     // k * WMMA_K, WMMA_K=16 -> (k << 4)
@@ -396,7 +396,10 @@ __global__ void __launch_bounds__(256)
 
     CP_ASYNC_COMMIT_GROUP();
   }
-
+  // 说一下为什么这里是cp async wait group的参数传入的是stage-2
+  // 参考reed大佬的那篇博客，以stage为5为例，前面已经提前发射了stage-1(这里为4)个异步拷贝任务。然后需要等到第一个异步拷贝任务完成之后，才能进入tile的计算
+  // 而这里的wait参数表示的意思是，允许还有多少个stage-2个异步组处于未完成状态时就继续执行，也即这段话保证了至少有stage - 1 - (stage - 2)个异步拷贝任务是已经执行完了
+  // stage - 1 - (stage - 2) = 1，正好符合reed大佬博客里面说的，在进入tile计算之前需要有一个异步拷贝任务完成的要求
   CP_ASYNC_WAIT_GROUP(K_STAGE - 2); // s2->0, s3->1, s4->2
   __syncthreads();
 
@@ -405,6 +408,34 @@ __global__ void __launch_bounds__(256)
     // s2/4 can use bitwise ops but s3 can not, so, we use mod
     // ops for all stages kernel. s2: (k + 1)&1, s4: (k + 1)&3
     // s3: (k + 1) % 3
+    /*
+    上面这段英文注释的意思是，对于stage 2或者stage 4这种2的幂次，可以使用更高效的位与运算(k+1) & K_STAGE来代替取模运算(k + 1) % K_STAGE
+    可是当stage不为2的幂次时，只能用取模运算，不能用位与运算。所以这里为了统一，不管stage是否为2的幂次，读统一用取模运算(k + 1) % K_STAGE
+    */
+
+    /*
+    介绍一下下面这两个变量的变化规律，以stage=3和stage=4为例
+    当stage=3时，变化规律如下:
+    k值 | smem_sel = (k+1) % 3 | smem_sel_next = k % 3 | 含义
+    ----|---------------------|----------------------|------
+    2   | (2+1) % 3 = 0      | 2 % 3 = 2           | 计算buffer0，加载到buffer2
+    3   | (3+1) % 3 = 1      | 3 % 3 = 0           | 计算buffer1，加载到buffer0  
+    4   | (4+1) % 3 = 2      | 4 % 3 = 1           | 计算buffer2，加载到buffer1
+    5   | (5+1) % 3 = 0      | 5 % 3 = 2           | 计算buffer0，加载到buffer2
+    6   | (6+1) % 3 = 1      | 6 % 3 = 0           | 计算buffer1，加载到buffer0
+    可以看到，当stage=3时，进入了这个for循环之后，首先k为2，此时会发射第2个buffer的异步拷贝任务(在进入这里的for循环之前，已经发射了stage-1个异步拷贝指令，且第0个异步拷贝已经完成)，同时计算第0个buffer中的数据
+    当k为3时，此时会发射第0个buffer的异步拷贝任务，然后计算第一个buffer的数据。依此类推
+
+    当stage=4时，变化规律如下
+    k值 | smem_sel = (k+1) % 4 | smem_sel_next = k % 4 | 含义
+    ----|---------------------|----------------------|------
+    3   | (3+1) % 4 = 0      | 3 % 4 = 3           | 计算buffer0，加载到buffer3
+    4   | (4+1) % 4 = 1      | 4 % 4 = 0           | 计算buffer1，加载到buffer0
+    5   | (5+1) % 4 = 2      | 5 % 4 = 1           | 计算buffer2，加载到buffer1  
+    6   | (6+1) % 4 = 3      | 6 % 4 = 2           | 计算buffer3，加载到buffer2
+    7   | (7+1) % 4 = 0      | 7 % 4 = 3           | 计算buffer0，加载到buffer3
+    8   | (8+1) % 4 = 1      | 8 % 4 = 0           | 计算buffer1，加载到buffer0
+    */
     int smem_sel = (k + 1) % K_STAGE; // s3 k 2->0, k 3->1, k 4->2...
     int smem_sel_next = k % K_STAGE;  // s3 k 2->2, k 3->0, k 4->1...
 
@@ -414,6 +445,7 @@ __global__ void __launch_bounds__(256)
     int load_gmem_b_k = k * WMMA_K + load_smem_b_k; // global row of b
     int load_gmem_b_addr = load_gmem_b_k * N + load_gmem_b_n;
 
+    // 这里是发射smem_sel_next指向的buffer的异步拷贝指令
     // load stage 2, k start from 2
     uint32_t load_smem_a_ptr =
         (smem_a_base_ptr + (smem_sel_next * s_a_stage_offset +
@@ -435,6 +467,7 @@ __global__ void __launch_bounds__(256)
                    wmma::row_major>
         B_frag[WARP_TILE_N];
 
+    // 从这里开始，是计算smem_sel指向的区域的数据的wmma，这里的wmma算完了就相当于算完了一个k tile(slice k)
 // compute stage 0
 #pragma unroll
     for (int i = 0; i < WARP_TILE_M; ++i) {
@@ -463,7 +496,13 @@ __global__ void __launch_bounds__(256)
         wmma::mma_sync(C_frag[i][j], A_frag[i], B_frag[j], C_frag[i][j]);
       }
     }
-
+    /*
+    说一下这里为什么wait的参数时stage-2
+    其实和前面的在进入tile循环之前的那个CP_ASYNC_WAIT_GROUP(K_STAGE - 2)有点类似
+    在进入tile循环之前已经发射了stage-1个异步拷贝任务，同时又使用wait等待了一个异步拷贝任务完成
+    之后进入tile的循环之后，又发射了一个异步拷贝任务，所以相当于其实还有stage-1个异步拷贝任务是没有被wait的
+    所以这里使用了CP_ASYNC_WAIT_GROUP(K_STAGE - 2)，保证了至少有一个异步拷贝任务执行完成了，才能接着继续执行
+    */
     CP_ASYNC_WAIT_GROUP(K_STAGE - 2);
     __syncthreads();
   }
