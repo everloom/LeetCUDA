@@ -118,6 +118,9 @@ using namespace nvcuda;
 HOST_DEVICE_INLINE
 int div_ceil(int a, int b) { return (a % b != 0) ? (a / b + 1) : (a / b); }
 
+/*
+下面这个mma的多级流水和block swizzle就不讲了，和hgemm_wmma_m16n16k16_mma4x2_warp2x4_stages_dsmem_kernel是一模一样的原理
+*/
 // 128x128, mma2x4, warp4x4(64,32,16), stages, block swizzle
 template <const int MMA_M = 16, const int MMA_N = 8, const int MMA_K = 16,
           const int MMA_TILE_M = 2, const int MMA_TILE_N = 4,
@@ -172,7 +175,7 @@ __global__ void __launch_bounds__(256)
 #pragma unroll
   for (int k = 0; k < (K_STAGE - 1); ++k) { // 0, 1
     // k * WMMA_K, WMMA_K=16 -> (k << 4)
-    int load_gmem_a_k = k * BK + load_smem_a_k; // global col of a
+    int load_gmem_a_k = k * BK + load_smem_a_k; // global col of a, 这个的意思是说load_gmem_a_k是A的gmem的列坐标
     int load_gmem_a_addr = load_gmem_a_m * K + load_gmem_a_k;
     int load_gmem_b_k = k * BK + load_smem_b_k; // global row of b
     int load_gmem_b_addr = load_gmem_b_k * N + load_gmem_b_n;
@@ -629,11 +632,29 @@ __global__ void __launch_bounds__(256)
 #endif
 }
 
+/*
+这个是reg double buffer，对应了reed大佬的multistage中的tile内流水线https://zhuanlan.zhihu.com/p/665082713
+这个代码属于是multistage的tile间和tile内流水线都实现了，属于是流水线优化的终极版本
+tile间的这里不多讲，这里主要将tile内的实现，即reg double buffer
+
+
+问了下cursor，这里之所以将k维度翻倍，一是为了提高计算强度，二是提高了mma的执行次数(代码里面可以看到分为了两个k为16的mma)，可以更好的隐藏内存访问延迟(内存访问是cp.async并行的)
+然后根据注释说的，这里k变成double了(从16变成32)，为了减少bank冲突，不能一次访问32，需要一次访问16
+所以把原本的[stages][BM][BK * WARP_TILE_K]的布局的smem变成了[stages * WARP_TILE_K][BM][BK]的布局
+目的就是把32拆成两个16去访问。直观上看是stage数翻倍了，实际上smem的大小仍然不变
+然后这里为什么改变smem布局、把k从32拆成两个16能减少bank冲突，这块虽然问了cursor但没怎么仔细看，以后如果有需要的话再研究这块
+
+下面主要讲一下reg double buffer
+*/
 // In order to reduce bank conflicts, we will save the K(16x2=32)
 // dimension by half according to the stage dimension. For example,
 // stages=3, warp_tile_k=2, it will be saved as [3*2][BM][16].
 // 128x128, mma2x4, warp4x4(64,32,32), stages, block swizzle, dsmem,
 // k32 with reg double buffers
+// 为了减少存储体冲突，我们将根据stage dimension将K(16x2=32)维度减半保存。
+// 例如，stages=3, warp_tile_k=2时，它将被保存为[3*2][BM][16]。
+// 128x128, mma2x4, warp4x4(64,32,32), 多阶段流水线, 块交换, 动态共享内存,
+// k32配合寄存器双缓冲
 template <const int MMA_M = 16, const int MMA_N = 8, const int MMA_K = 16,
           const int MMA_TILE_M = 2, const int MMA_TILE_N = 4,
           const int WARP_TILE_M = 4, const int WARP_TILE_N = 4,
@@ -647,10 +668,10 @@ __global__ void __launch_bounds__(256)
   // BLOCK_SWIZZLE 0/1 control use block swizzle or not.
   const int bx = ((int)BLOCK_SWIZZLE) * blockIdx.z * gridDim.x + blockIdx.x;
   const int by = blockIdx.y;
-  const int NUM_K_TILES = div_ceil(K, MMA_K * WARP_TILE_K);
+  const int NUM_K_TILES = div_ceil(K, MMA_K * WARP_TILE_K); // 这里因为tile内分了两个ktile，所以MMA_K乘上了WARP_TILE_K
   constexpr int BM = MMA_M * MMA_TILE_M * WARP_TILE_M; // 16*2*4=128
   constexpr int BN = MMA_N * MMA_TILE_N * WARP_TILE_N; // 8*4*4=128
-  constexpr int BK = MMA_K;                            // 16x2=32
+  constexpr int BK = MMA_K;                            // 16x2=32 ，看了下代码，这里MMA_K还是16
 
   extern __shared__ half smem[];
   half *s_a = smem;
@@ -696,6 +717,8 @@ __global__ void __launch_bounds__(256)
     int load_gmem_b_k = k * BK * WARP_TILE_K + load_smem_b_k; // global row of b
     int load_gmem_b_addr = load_gmem_b_k * N + load_gmem_b_n;
 
+    // 可以看到这里关于a矩阵加载了两次，是因为k维度翻倍变成了32
+    // 但这里将32的k拆成了两个16，所以进行了两次加载，第一次加载前16的k，第二次加载后16的k
     uint32_t load_smem_a_ptr =
         (smem_a_base_ptr +
          (k * s_a_stage_offset + load_smem_a_m * (BK + A_PAD) + load_smem_a_k) *
@@ -728,12 +751,18 @@ __global__ void __launch_bounds__(256)
   CP_ASYNC_WAIT_GROUP(K_STAGE - 2); // s2->0, s3->1, s4->2
   __syncthreads();
 
+  // 这里因为使用了tile内流水（32的大k tile分成了两个16的小k tile），所以需要的RA和RB寄存器翻倍了
   uint32_t RA[2][WARP_TILE_M][4];
   uint32_t RB[2][WARP_TILE_N][2];
 
+  // 这两个参数用于控制tile内流水，因为使用的双缓冲，即大k tile分成了两个小k tile
+  // 所以这里用了两个变量控制寄存器
   int reg_store_idx = 0;
   int reg_load_idx = 1;
 
+  // 这里在进入tile内的k tile for循环之前，需要提前加载了tile内的小k tile的数据
+  // 这里是将每个k tile分成了两个小k tile，所以这里是加载的第一个小k tile的数据
+  // 这个步骤就是reed大佬的gemm流水线博客里面的那个图，第一个黑色虚线和黑色实线部分
   {
 // ldmatrix for s_a, ldmatrix.trans for s_b.
 // smem -> reg buffers 0, first MMA_K, 0~15
@@ -766,6 +795,8 @@ __global__ void __launch_bounds__(256)
     }
   }
 
+  // 这里进入tile内的k tile for循环
+  // 需要注意的是，因为k tile的循环次数按照k tile大小为32计算的
 #pragma unroll
   for (int k = (K_STAGE - 1); k < NUM_K_TILES; ++k) {
     reg_store_idx ^= 1;               // 0->1
@@ -778,7 +809,8 @@ __global__ void __launch_bounds__(256)
     int load_gmem_a_addr = load_gmem_a_m * K + load_gmem_a_k;
     int load_gmem_b_k = k * BK * WARP_TILE_K + load_smem_b_k; // global row of b
     int load_gmem_b_addr = load_gmem_b_k * N + load_gmem_b_n;
-
+    // tile间流水，发射下一个stage的cp.async
+    // 这里因为把32的k tile拆成了两个16的小k tile，所以对于A和B，都需要发射两次cp.async
     uint32_t load_smem_a_ptr =
         (smem_a_base_ptr + (smem_sel_next * s_a_stage_offset +
                             load_smem_a_m * (BK + A_PAD) + load_smem_a_k) *
@@ -810,6 +842,8 @@ __global__ void __launch_bounds__(256)
 
 // ldmatrix for s_a, ldmatrix.trans for s_b.
 // smem -> reg buffers 1, second MMA_K, 16~31
+// 上面发射完了cp.async之后，这里需要将第二个小ktile的数据加载到寄存器中
+// 可以看到这里的reg_store_idx，在进入for循环之后，从0变为了1
 #pragma unroll
     for (int i = 0; i < WARP_TILE_M; ++i) {
       int warp_smem_a_m = warp_m * (MMA_M * WARP_TILE_M) + i * MMA_M;
@@ -841,11 +875,31 @@ __global__ void __launch_bounds__(256)
     }
 
 // MMA compute, first MMA_K
+// 加载完第二个小k tile的数据到寄存器之后，开始计算第一个小k tile的mma
+// 这里的reg_load_idx，在进入for循环之后，从1变为了0
 #pragma unroll
     for (int i = 0; i < WARP_TILE_M; ++i) {
 #pragma unroll
       for (int j = 0; j < WARP_TILE_N; ++j) {
         // Warp swizzle: Right -> Left -> Right -> Left
+        /*
+        说一下这里的warp swizzle，这里只是对RC和RB里面数据的访问顺序进行了swizzle，swizzle与否都不影响计算结果
+        cursor说这里的warp swizzle的目的是为了减少reg的bank冲突
+        当没有swizzle时，i j的变化顺序如下：
+        i=0: j_s = 0,1,2,3  (左到右)
+        i=1: j_s = 0,1,2,3  (左到右)  
+        i=2: j_s = 0,1,2,3  (左到右)
+        i=3: j_s = 0,1,2,3  (左到右)
+        当有了swizzle时，i j的变化顺序如下
+        i=0: j_s = 0,1,2,3     (左到右) ← i%2=0，偶数行
+        i=1: j_s = 3,2,1,0     (右到左) ← i%2=1，奇数行反转
+        i=2: j_s = 0,1,2,3     (左到右) ← i%2=0，偶数行  
+        i=3: j_s = 3,2,1,0     (右到左) ← i%2=1，奇数行反转
+        我理解是，由于这里的循环展开优化，外加不同线程本来运行速度不一样
+        有的线程此时可能才运行到i=0，有的可能已经运行到了i=1
+        然后这两个线程在j上访问的顺序就会不一样（i=0的线程j是正序访问，i=1的线程j是逆序访问）
+        所以就能在一定程度上减少reg的bank冲突
+        */
         int j_s = ((i % 2) && WARP_SWIZZLE) ? (WARP_TILE_N - j - 1) : j;
         HMMA16816(RC[i][j_s][0], RC[i][j_s][1], RA[reg_load_idx][i][0],
                   RA[reg_load_idx][i][1], RA[reg_load_idx][i][2],
@@ -857,6 +911,7 @@ __global__ void __launch_bounds__(256)
     reg_store_idx ^= 1; // 1 -> 0
     reg_load_idx ^= 1;  // 0 -> 1
 // MMA compute, second MMA_K
+// 这里计算第二个mma，对应第二个小k tile
 #pragma unroll
     for (int i = 0; i < WARP_TILE_M; ++i) {
 #pragma unroll

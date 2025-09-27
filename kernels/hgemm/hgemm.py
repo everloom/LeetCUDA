@@ -510,7 +510,7 @@ for M, N, K in zip(Ms, Ns, Ks):
             c,
         )
         run_benchmark(
-            hgemm.hgemm_wmma_m16n16k16_mma4x2_warp2x4_stages_dsmem,
+            hgemm.hgemm_wmma_m16n16k16_mma4x2_warp2x4_stages_dsmem, # dsmem表示使用动态smem
             a,
             b,
             "(wmma4x2+warp2x4+stage3+dsmem)",
@@ -672,7 +672,7 @@ for M, N, K in zip(Ms, Ns, Ks):
         )
     if (args.enable_mma or args.enable_mma_all) and (not args.no_default):
         run_benchmark(
-            hgemm.hgemm_mma_m16n8k16_mma2x4_warp4x4_stages_dsmem,
+            hgemm.hgemm_mma_m16n8k16_mma2x4_warp4x4_stages_dsmem, # 这个相比hgemm_mma_m16n8k16_mma2x4_warp4x4_stages，只是把静态分配的smem换为了动态smem而已
             a,
             b,
             "(mma2x4+warp4x4+stage3+dsmem)",

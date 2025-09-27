@@ -386,6 +386,10 @@ __global__ void __launch_bounds__(256)
         (smem_a_base_ptr +
          (k * s_a_stage_offset + load_smem_a_m * (BK + A_PAD) + load_smem_a_k) *
              sizeof(half));
+    // 16表示每个线程搬多少字节的个数
+    // 这里A tile的大小是BM×BK ，在这里为128*16
+    // 128*16/256=8,即一个block中的线程,每个搬8个half才能把128*16个half从gmem搬到smem,8个half就是16字节
+    // 这里忽略A_PAD参数，因为A_PAD只是用来改变smem中数据的填充顺序的，与从gmem中搬多少个数据无关，下同
     CP_ASYNC_CG(load_smem_a_ptr, &A[load_gmem_a_addr], 16);
 
     uint32_t load_smem_b_ptr =

@@ -160,12 +160,19 @@ __global__ void hgemm_mma_m16n8k16_naive_kernel(half *A, half *B, half *C,
   }
 }
 
+/*
+这里warp4x4的意思是，每个warp计算16个mma，第一个4代表的意思时需要A矩阵中的4个16*16的矩阵到smem中（64*16），第二个4表示需要B矩阵的4个16*8到smem中(16*32)
+mma2x4的意思是，一个threadblock tile中有8个warp tile。mma的2表示需要两个64*16的矩阵到smem中(一共128*16)，mma的4表示需要4个16*32(一共16*128)的矩阵到smem中
+mma2x4的2x4是通过simt完成（不是for循环完成），warp的4x4是通过kernel中的for循环完成
+所以threadblock tile的大小就是128*128，warp tile的大小是64*32
+还有就是，这里加了padding避免bank冲突，但对于这里的mma为什么加padding能解决bank冲突我没怎么仔细研究
+*/
 // 128x128, mma2x4, warp4x4(64,32,16)
 template <const int MMA_M = 16, const int MMA_N = 8, const int MMA_K = 16,
           const int MMA_TILE_M = 2, const int MMA_TILE_N = 4,
           const int WARP_TILE_M = 4, const int WARP_TILE_N = 4,
           const int A_PAD = 0, const int B_PAD = 0>
-__global__ void __launch_bounds__(256)
+__global__ void __launch_bounds__(256) // 这里launch_bounds传入的参数与一个block中的线程数量一致
     hgemm_mma_m16n8k16_mma2x4_warp4x4_kernel(half *A, half *B, half *C, int M,
                                              int N, int K) {
   const int bx = blockIdx.x;
@@ -203,6 +210,9 @@ __global__ void __launch_bounds__(256)
   if (load_gmem_a_m >= M || load_gmem_b_n >= N)
     return;
 
+  // 这里RC的WARP_TILE_M和WARP_TILE_N表示，因为这里每个warp要计算WARP_TILE_M*WARP_TILE_N(4*4)个mma，所以需要RC[WARP_TILE_M][WARP_TILE_N]来存结果
+  // 然后RC的[2]是需要满足mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16对结果寄存器的要求，这个mma计算就是要求每次mma结果需要用两个32位的寄存器来存结果
+  // 但为什么要求要两个32位的寄存器存结果，这个需要好好看一下ptx手册，这块我还没仔细看
   uint32_t RC[WARP_TILE_M][WARP_TILE_N][2];
 #pragma unroll
   for (int i = 0; i < WARP_TILE_M; ++i) {
@@ -227,6 +237,8 @@ __global__ void __launch_bounds__(256)
     __syncthreads();
 
     // ldmatrix for s_a, ldmatrix.trans for s_b.
+    // RA的[4]表示每次mma需要4个32位寄存器，RB的[2]表示每次mma需要2个32位寄存器，这个是mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16指令的要求，详细的可以看ppt解释，也可以看ptx文档
+    // RA的WARP_TILE_M，表示warp4x4的第一个4，RB的WARP_TILE_N表示warp4x4的第二个4。这样做是因为每个warp都要算4x4次mma
     uint32_t RA[WARP_TILE_M][4];
     uint32_t RB[WARP_TILE_N][2];
 
@@ -348,6 +360,8 @@ void hgemm_mma_m16n8k16_mma2x4_warp4x4(torch::Tensor a, torch::Tensor b,
   constexpr int WARP_TILE_M = 4;
   constexpr int WARP_TILE_N = 4;
   // bank conflicts free via pad = 8, reject fantasy, trust the profile.
+  // 通过 pad = 8 避免 bank conflicts，拒绝幻想，相信性能分析结果。
+  // profile命令如下
   // ncu --metrics l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld
   // ./hgemm_mma_stage.89.debug.bin ncu --metrics
   // sm__sass_l1tex_data_bank_conflicts_pipe_lsu_mem_shared_op_ldsm

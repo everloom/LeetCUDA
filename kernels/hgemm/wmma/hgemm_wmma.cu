@@ -168,10 +168,15 @@ __global__ void hgemm_wmma_m16n16k16_mma4x2_kernel(half *A, half *B, half *C,
 // 这里的代码和b站up主的wmma的v3代码是一致的，下面以m n k为512 2048 1024为例讲解
 // 这里的代码相对于之前的hgemm_wmma_m16n16k16_mma4x2_kernel（v2版本的代码）的改动点在于，增加了每个warp的计算量
 // 在v2的代码中，每个warp只计算一次wmma，而这里，每个warp需要计算8次wmma
+// mma4x2定义了threadblock tile的大小，warp2x4定义了warp tile的大小
 // 这里warp2x4的意思是，每个warp负责8次wmma的计算。2的意思是，需要A中的两个16*16的矩阵载入到了smem中（构成了一个32*16的矩阵），4的意思是，需要B中的四个16*16的矩阵载入到了smem中（构成了一个16*64的矩阵）
 // 然后mma4x2的意思时，有8个warp tile。每个warp tile就是一个warp2x4，会计算8次wmma
 // mma4x2中的4表示的是，需要在smem为A tile开辟4个 2*16*16的空间（这里2就是warp2x4的2），总大小为128*16
 // 然后mma4x2的2表示，需要在smem为B tile开辟2个 16*16*4的空间（这里4就是warp2x4的4），总大小为16*128
+// threadblock tile的大小为128 x 128 ，第一个128 = mma的4 * warp的2 * WMMA_M，第二个128 = mma的2 * warp的4 * WMMA_N
+// warp tile的大小为32 x 64( warp的2 * WMMA_M x warp的4 * WMMA_N)
+// 对于warp2x4的8个wmma计算，通过kernel里面的for循环实现
+// 对于mma4x2的8个warp的计算，是由一个block中8个warp分别计算的，所以并没有在kernel中通过for循环体现，而时通过simt实现的
 template <const int WMMA_M = 16, const int WMMA_N = 16, const int WMMA_K = 16,
           const int WMMA_TILE_M = 4, const int WMMA_TILE_N = 2,
           const int WARP_TILE_M = 2, const int WARP_TILE_N = 4>
