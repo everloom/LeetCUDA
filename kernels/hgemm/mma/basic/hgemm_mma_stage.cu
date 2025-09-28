@@ -634,17 +634,16 @@ __global__ void __launch_bounds__(256)
 
 /*
 这个是reg double buffer，对应了reed大佬的multistage中的tile内流水线https://zhuanlan.zhihu.com/p/665082713
-这个代码属于是multistage的tile间和tile内流水线都实现了，属于是流水线优化的终极版本
-tile间的这里不多讲，这里主要将tile内的实现，即reg double buffer
+这个代码属于是multistage的tile间和tile内流水线都实现了，这里的reg double buffer相当于两级的tile内流水
+看代码可以发现，在大K tile的for循环中，tile内流水的顺序是这样的（假设32的大K分为了K1和K2的两个小k tile）：
+  loadmatrix k2 -> mma k1 -> mma k2 -> loadmatrix k1
+这里loadmatrix和mma都是同步指令，所以直观看上去上面的这种顺序是没办法形成流水线的
+我理解这里可能因为loadmatrix k2和mma k1在数据上没有依赖，所以编译器在编译时可以将loadmatrix k2和mma k1同时发射，这样有可能形成流水线（未完持续）
 
-
-问了下cursor，这里之所以将k维度翻倍，一是为了提高计算强度，二是提高了mma的执行次数(代码里面可以看到分为了两个k为16的mma)，可以更好的隐藏内存访问延迟(内存访问是cp.async并行的)
-然后根据注释说的，这里k变成double了(从16变成32)，为了减少bank冲突，不能一次访问32，需要一次访问16
+根据注释说的，这里k变成double了(从16变成32)，为了减少bank冲突，不能一次访问32，需要一次访问16
 所以把原本的[stages][BM][BK * WARP_TILE_K]的布局的smem变成了[stages * WARP_TILE_K][BM][BK]的布局
 目的就是把32拆成两个16去访问。直观上看是stage数翻倍了，实际上smem的大小仍然不变
 然后这里为什么改变smem布局、把k从32拆成两个16能减少bank冲突，这块虽然问了cursor但没怎么仔细看，以后如果有需要的话再研究这块
-
-下面主要讲一下reg double buffer
 */
 // In order to reduce bank conflicts, we will save the K(16x2=32)
 // dimension by half according to the stage dimension. For example,
@@ -899,6 +898,7 @@ __global__ void __launch_bounds__(256)
         有的线程此时可能才运行到i=0，有的可能已经运行到了i=1
         然后这两个线程在j上访问的顺序就会不一样（i=0的线程j是正序访问，i=1的线程j是逆序访问）
         所以就能在一定程度上减少reg的bank冲突
+        更多具体的细节我没有继续深究了，后面有需要的话再来继续研究这块
         */
         int j_s = ((i % 2) && WARP_SWIZZLE) ? (WARP_TILE_N - j - 1) : j;
         HMMA16816(RC[i][j_s][0], RC[i][j_s][1], RA[reg_load_idx][i][0],
@@ -912,6 +912,7 @@ __global__ void __launch_bounds__(256)
     reg_load_idx ^= 1;  // 0 -> 1
 // MMA compute, second MMA_K
 // 这里计算第二个mma，对应第二个小k tile
+// 这的的reg load idx在经过上面的反转之后，又从0变为了1
 #pragma unroll
     for (int i = 0; i < WARP_TILE_M; ++i) {
 #pragma unroll
@@ -924,13 +925,23 @@ __global__ void __launch_bounds__(256)
                   RB[reg_load_idx][j_s][1], RC[i][j_s][0], RC[i][j_s][1]);
       }
     }
-
+    // 前面已经把所有的tile内的mma计算完了，所以这里需要等待下一次大K迭代所需要的结果已经加载完成，所以这里需要再一次wait
     CP_ASYNC_WAIT_GROUP(K_STAGE - 2);
     __syncthreads();
 
+    /*
+    上面执行wait之后，下一次for循环迭代所需要的数据已经从gmem拷贝到了smem，这里需要在进入下一个
+    大K的for循环之前，提前将一个大K的迭代的第一个小k tile的数据拷贝到reg中
+    */
     // load next k iters to reg buffers.
     // smem -> reg buffers 0, first MMA_K, 0~15
     // int smem_sel_reg = (k + 2) % K_STAGE; // vs smem_sel k=2->(0)1, k=3->(1)2
+    // 正在为下一轮大K维度的迭代加载数据到寄存器缓冲区, 为了提前准备下一次小k的MMA计算所需的数据
+    // 从smem加载数据到寄存器缓冲区0
+    // smem_sel_reg = (k + 2) % K_STAGE与这里的smem_sel_reg = (smem_sel + 1) % K_STAGE是等价的
+    // 实现了这样的效果，以stage=3为例，k=2时，smem_sel=0, smem_sel_reg=1
+    // 当k=3时，smem_sel=1, smem_sel_reg=2
+    // smem_sel代表了当前for循环迭代计算的buffer的index，smem_sel_reg代表了下一轮for循环计算的buffer的index
     int smem_sel_reg =
         (smem_sel + 1) % K_STAGE; // vs smem_sel k=2->(0)1, k=3->(1)2
 #pragma unroll
@@ -974,10 +985,13 @@ __global__ void __launch_bounds__(256)
     for (int k = 0; k < (K_STAGE - 1); k++) {
       reg_store_idx ^= 1; // 0->1
       reg_load_idx ^= 1;  // 1->0
-
+      // 这个stage_sel负责计算收尾部分的buffer的index
+      // 前面主循环结束后，还有K_STAGE-1个buffer的数据没有计算
+      // 还不懂可以看hgemm_wmma_m16n16k16_mma4x2_warp2x4_stages_dsmem_kernel里面的注释
       int stage_sel = ((NUM_K_TILES - (K_STAGE - 1) + k) % K_STAGE);
 // ldmatrix for s_a, ldmatrix.trans for s_b.
 // smem -> reg buffers 1, second MMA_K
+      // 这里仍然是加载第二个小k tile的数据(第一个小ktile的数据加载已经在上面主循环的最后那块执行了)
 #pragma unroll
       for (int i = 0; i < WARP_TILE_M; ++i) {
         int warp_smem_a_m = warp_m * (MMA_M * WARP_TILE_M) + i * MMA_M;
@@ -1008,6 +1022,7 @@ __global__ void __launch_bounds__(256)
       }
 
 // MMA compute, first MMA_K
+      // 计算第一个小k tile的mma
 #pragma unroll
       for (int i = 0; i < WARP_TILE_M; ++i) {
 #pragma unroll
@@ -1025,6 +1040,7 @@ __global__ void __launch_bounds__(256)
       reg_load_idx ^= 1;  // 0 -> 1
 
 // MMA compute, second MMA_K
+      // 计算第二个小k tile的mma
 #pragma unroll
       for (int i = 0; i < WARP_TILE_M; ++i) {
 #pragma unroll
@@ -1041,6 +1057,7 @@ __global__ void __launch_bounds__(256)
       // load next k iters to reg buffers.
       // smem -> reg buffers 0, first MMA_K, 0~15
       // int stage_sel_reg = ((NUM_K_TILES - K_STAGE + k) % K_STAGE);
+      // 加载下一轮大k tile的第一个小k tile的数据到reg
       int stage_sel_reg = (stage_sel + 1) % K_STAGE;
 #pragma unroll
       for (int i = 0; i < WARP_TILE_M; ++i) {
@@ -1075,10 +1092,25 @@ __global__ void __launch_bounds__(256)
   for (int i = 0; i < WARP_TILE_M; ++i) {
 // reuse RA[2][4][4] reg here, this may boost 0.3~0.5 TFLOPS up.
 // may not put 'if' in N loop, it will crash the 'pragma unroll' hint ?
+/*
+这里原本RC[i][j]: 存储MMA计算的结果
+对于RA[0/1][j]: 原本用于输入数据A的寄存器，现在复用来存储输出数据
+这样节省寄存器使用，提升0.3~0.5 TFLOPS
+*/
 #pragma unroll
     for (int j = 0; j < WARP_TILE_N; ++j) {
       // How to use LDST128BITS here? __shfl_sync -> lane 0 -> store 8 half.
       // thus, we only need 8 memory issues with 128 bits after shfl_sync.
+      // 这里为了使用LDST128BITS存储结果，使用了warp shuffle，将数据汇聚到特定线程（一个warp32个线程的数据放到了其中8个线程中存储）
+      // 这样做的好处是，为shuffle之前，32个线程 × 32位存储 = 32个内存事务
+      // shuffle之后8个线程 × 128位存储 = 8个内存事务。可以看到shuffle之后内存事务减少
+      /*
+      这里的warp shuffle的目的: 将每个线程的数据通过warp shuffle收集到特定线程上，为合并写入做准备
+      数据流向:
+        线程0收集：自己的数据 + 线程1,2,3的数据
+        线程4收集：自己的数据 + 线程5,6,7的数据
+      */
+
       RA[0][j][0] = RC[i][j][0];
       RA[1][j][0] = RC[i][j][1];
       RA[0][j][1] = __shfl_sync((0xffffffff), RC[i][j][0], lane_id + 1);
@@ -1088,7 +1120,13 @@ __global__ void __launch_bounds__(256)
       RA[1][j][2] = __shfl_sync((0xffffffff), RC[i][j][1], lane_id + 2);
       RA[1][j][3] = __shfl_sync((0xffffffff), RC[i][j][1], lane_id + 3);
     }
-
+    /*
+    if (lane_id % 4 == 0): 只有线程0,4,8,12,16,20,24,28参与存储
+    原因:
+      每4个线程的数据被shuffle到第0个线程（线程0,4,8...）
+      这些线程现在各自持有4个线程的数据
+      减少内存事务数量：从32个线程写入 → 8个线程写入
+    */
     if (lane_id % 4 == 0) {
       int store_warp_smem_c_m = warp_m * (MMA_M * WARP_TILE_M) + i * MMA_M;
       int store_lane_gmem_c_m = by * BM + store_warp_smem_c_m + lane_id / 4;
