@@ -521,6 +521,21 @@ __global__ void __launch_bounds__(256)
   {
 #pragma unroll
     for (int k = 0; k < (K_STAGE - 1); k++) {
+      // 这个stage_sel负责计算收尾部分的buffer的index
+      // 前面主循环结束后，还有K_STAGE-1个buffer的数据没有计算
+      // 这里以 NUM_K_TILES = 10, K_STAGE = 3为例
+      // 对于上面的主循环，k的迭代流程如下：
+      // k=2: 计算buffer1, 加载数据到buffer2  
+      // k=3: 计算buffer2, 加载数据到buffer0
+      // k=4: 计算buffer0, 加载数据到buffer1
+      // k=5: 计算buffer1, 加载数据到buffer2
+      // ...
+      // k=8: 计算buffer2, 加载数据到buffer2  
+      // k=9: 计算buffer0, 加载数据到buffer0  (最后一轮)
+      // 主循环执行完成之后，还有k=8加载的buffer2，k=9加载的buffer0没有计算
+      // 这里stage_sel负责计算buffer2和buffer0的index
+      // 当k=0时，stage_sel = (10 - (3 - 1) + 0) % 3 = 2
+      // 当k=1时，stage_sel = (10 - (3 - 1) + 1) % 3 = 0
       const int stage_sel = ((NUM_K_TILES - (K_STAGE - 1) + k) % K_STAGE);
       wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half,
                      wmma::row_major>
