@@ -161,8 +161,8 @@ __global__ void hgemm_mma_m16n8k16_naive_kernel(half *A, half *B, half *C,
 }
 
 /*
-这里warp4x4的意思是，每个warp计算16个mma，第一个4代表的意思时需要A矩阵中的4个16*16的矩阵到smem中（64*16），第二个4表示需要B矩阵的4个16*8到smem中(16*32)
-mma2x4的意思是，一个threadblock tile中有8个warp tile。mma的2表示需要两个64*16的矩阵到smem中(一共128*16)，mma的4表示需要4个16*32(一共16*128)的矩阵到smem中
+这里warp4x4的意思是，每个warp计算16个mma，第一个4代表的意思时需要A矩阵中的4个16*16的矩阵从smem到reg中（64*16），第二个4表示需要B矩阵的4个16*8从reg到smem中(16*32)
+mma2x4的意思是，一个threadblock tile中有8个warp tile。mma的2表示需要两个64*16的矩阵从gmem到smem中(一共128*16)，mma的4表示需要4个16*32(一共16*128)的矩阵从gmem到smem中
 mma2x4的2x4是通过simt完成（不是for循环完成），warp的4x4是通过kernel中的for循环完成
 所以threadblock tile的大小就是128*128，warp tile的大小是64*32
 还有就是，这里加了padding避免bank冲突，但对于这里的mma为什么加padding能解决bank冲突我没怎么仔细研究

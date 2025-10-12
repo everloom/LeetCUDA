@@ -639,6 +639,12 @@ __global__ void __launch_bounds__(256)
   loadmatrix k2 -> mma k1 -> mma k2 -> loadmatrix k1
 这里loadmatrix和mma都是同步指令，所以直观看上去上面的这种顺序是没办法形成流水线的
 我理解这里可能因为loadmatrix k2和mma k1在数据上没有依赖，所以编译器在编译时可以将loadmatrix k2和mma k1同时发射，这样有可能形成流水线（未完持续）
+然后是关于这里的mma2x4和warp4x4x2的含义(可以类比hgemm_mma_m16n8k16_mma2x4_warp4x4_kernel这个函数进行理解)
+这里threadblock tile大小为128*128，warp tile大小为64*32，但与hgemm_mma_m16n8k16_mma2x4_warp4x4_kernel不同的是，这里k tile变成了32，翻倍了
+然后这里把32的大k tile拆成了两个16的小k tile，并做了tile内的流水
+这里mma2x4的含义就是，一个threadblock tile中有8个warp tile。mma的2表示需要两个64*32的矩阵从gmem到smem中(一共128*32)，mma的4表示需要4个32*32(一共32*128)的矩阵从gmem到smem中
+对于warp4x4x2，这里的2的含义是，因为32的k tile分为了两个16的小k tile，所以warp每次k tile循环中，需要算两次warp4x4的计算（两个16的小k tile）
+而warp4x4的意思是，每个小k tile计算16个mma，第一个4代表的意思时需要A矩阵中的4个16*16的矩阵从smem到reg中（64*16），第二个4表示需要B矩阵的4个16*8从reg到smem中(16*32)
 
 根据注释说的，这里k变成double了(从16变成32)，为了减少bank冲突，不能一次访问32，需要一次访问16
 所以把原本的[stages][BM][BK * WARP_TILE_K]的布局的smem变成了[stages * WARP_TILE_K][BM][BK]的布局
@@ -722,6 +728,10 @@ __global__ void __launch_bounds__(256)
         (smem_a_base_ptr +
          (k * s_a_stage_offset + load_smem_a_m * (BK + A_PAD) + load_smem_a_k) *
              sizeof(half));
+    // 16表示每个线程搬多少字节的个数
+    // 这里A的小k tile的大小是BM×BK ，在这里为128*16
+    // 128*16/256=8,即一个block中的线程,每个搬8个half才能把128*16个half从gmem搬到smem,8个half就是16字节
+    // 这里忽略A_PAD参数，因为A_PAD只是用来改变smem中数据的填充顺序的，与从gmem中搬多少个数据无关，下同
     CP_ASYNC_CG(load_smem_a_ptr, &A[load_gmem_a_addr], 16); // MMA_K 0
     uint32_t load_smem_a_mma_k_ptr =
         (smem_a_base_ptr + s_a_mma_k_store_offset * sizeof(half) +
@@ -1144,12 +1154,19 @@ __global__ void __launch_bounds__(256)
   }
 }
 
+// 这个kernel基本和hgemm_mma_m16n8k16_mma2x4_warp4x4x2_stages_dsmem_kernel一致（下面称为base kernel）
+// 改动之处在于，使用x4一次性载入B的两个小k tile，而不是像base kernel中、使用x2分两次载入B的两个小k tile
+// 这样的好处是只用一个x4就完成了两个x2的工作
+// kernel名字中的x4就是使用x4加载B的两个小k tile的意思
 // NOTE: use ldmatrix.x4.trans for matrix B smem -> reg
 // In order to reduce bank conflicts, we will save the K(16x2=32)
 // dimension by half according to the stage dimension. For example,
 // stages=3, warp_tile_k=2, it will be saved as [3*2][BM][16].
 // 128x128, mma2x4, warp4x4(64,32,32), stages, block swizzle, dsmem,
 // k32 with reg double buffers
+// 注意：对矩阵B使用 ldmatrix.x4.trans 指令从共享内存加载到寄存器
+// 为了减少存储体冲突（bank conflicts），我们将根据stage（流水线阶段）维度将K维度（16×2=32）拆分存储。例如，当stages=3、warp_tile_k=2时，数据将被保存为 [3×2][BM][16] 的形式。
+// 配置说明：128×128（矩阵块大小）、mma2x4（每个warp的MMA tile配置）、warp4x4（warp布局，对应64,32,32的线程块配置）、stages（流水线阶段数）、block swizzle（块级重排优化）、dsmem（动态共享内存）、k32（K维度为32）配合寄存器双缓冲。
 template <const int MMA_M = 16, const int MMA_N = 8, const int MMA_K = 16,
           const int MMA_TILE_M = 2, const int MMA_TILE_N = 4,
           const int WARP_TILE_M = 4, const int WARP_TILE_N = 4,
@@ -1266,7 +1283,10 @@ __global__ void __launch_bounds__(256)
                   RA[reg_store_idx][i][2], RA[reg_store_idx][i][3],
                   lane_smem_a_ptr);
     }
-
+    // 这里是第一处优化点（相比hgemm_mma_m16n8k16_mma2x4_warp4x4x2_stages_dsmem_kernel，这里称之为base kernel）
+    // 在base kernel中，在k tile的for循环之外，会使用x2加载B的第一个小k tile，然后再k tile for循环之内再使用一次x2加载B的第二个小k tile
+    // 但在这里的kernel中，直接在k tile for循环之前，使用一个x4将B的第一个和第二个小k tile矩阵(reg_store_idx和reg_load_idx)都加载到了reg中
+    // 同时在小k tile的for循环中，原本加载第二个小k tile的数据的部分，变为了只加载A的第二个小k tile，加载B的第二个小k tile的代码则消失了，因为在这里已经使用x4将B的两个小k tile都加载了
 #pragma unroll
     for (int j = 0; j < WARP_TILE_N; ++j) {
       int warp_smem_b_n = warp_n * (MMA_N * WARP_TILE_N) + j * MMA_N;
@@ -1327,6 +1347,8 @@ __global__ void __launch_bounds__(256)
     CP_ASYNC_CG(load_smem_b_mma_k_ptr, &B[load_gmem_b_addr_mma_k], 16);
     CP_ASYNC_COMMIT_GROUP();
 
+// 这里就是上面提到的，加载第二个小k tile的代码
+// 可以看到这里只加载了A的第二个小k tile，没有加载B的
 // ldmatrix for s_a, ldmatrix.trans for s_b.
 // smem -> reg buffers 1, second MMA_K, 16~31
 #pragma unroll
@@ -1376,7 +1398,8 @@ __global__ void __launch_bounds__(256)
 
     CP_ASYNC_WAIT_GROUP(K_STAGE - 2);
     __syncthreads();
-
+    // 这里需要注意，这里是用来加载下一个大k tile循环的第一个小k tile的代码
+    // 可以看到，这里加载B的k tile，也是直接用一个x4、将下一个大k tile循环的两个B的小k tile一次性载入了，原理和最上面的那个x4载入B的两个k tile一致
     // load next k iters to reg buffers.
     // smem -> reg buffers 0, first MMA_K, 0~15
     // int smem_sel_reg = (k + 2) % K_STAGE; // vs smem_sel k=2->(0)1, k=3->(1)2
@@ -1548,12 +1571,17 @@ __global__ void __launch_bounds__(256)
   }
 }
 
+// 这个代码的实现和hgemm_mma_m16n8k16_mma2x4_warp4x4x2_stages_dsmem_kernel是一致的
+// 区别是，这里的kernel中少使用了一些中间变量，因此减少了一些寄存器的使用
 // NOTE: reduce registers usage.
 // In order to reduce bank conflicts, we will save the K(16x2=32)
 // dimension by half according to the stage dimension. For example,
 // stages=3, warp_tile_k=2, it will be saved as [3*2][BM][16].
 // 128x128, mma2x4, warp4x4(64,32,32), stages, block swizzle, dsmem,
 // k32 with reg double buffers
+// 为了减少存储体冲突（bank conflicts），我们将根据stage（流水线阶段）维度将K维度（16×2=32）拆分存储
+// 例如，当stages=3、warp_tile_k=2时，数据将被保存为 [3×2][BM][16] 的形式。
+// 配置说明：128×128（矩阵块大小）、mma2x4（每个warp的MMA tile配置）、warp4x4（warp布局，对应64,32,32的线程块配置）、stages（流水线阶段数）、block swizzle（块级重排优化）、dsmem（动态共享内存）、k32（K维度为32）配合寄存器双缓冲。
 template <const int MMA_M = 16, const int MMA_N = 8, const int MMA_K = 16,
           const int MMA_TILE_M = 2, const int MMA_TILE_N = 4,
           const int WARP_TILE_M = 4, const int WARP_TILE_N = 4,

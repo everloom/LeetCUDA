@@ -118,6 +118,12 @@ using namespace nvcuda;
 HOST_DEVICE_INLINE
 int div_ceil(int a, int b) { return (a % b != 0) ? (a / b + 1) : (a / b); }
 
+// 说一下这里的tn什么意思，和下面注释说的一样，就是B的布局变了，变成col major了
+// 这里和hgemm_mma_m16n8k16_mma2x4_warp4x4_stages_dsmem_kernel做对比
+// hgemm_mma_m16n8k16_mma2x4_warp4x4_stages_dsmem_kernel的B的布局是row major，shape是KxN
+// 这里的kernel的B是col major，shape是NxK
+// 一个点就是，在hgemm_mma_m16n8k16_mma2x4_warp4x4_stages_dsmem_kernel中，载入B的k tile使用的LDMATRIX_X2_T
+// 而在这里，载入B的k tile使用的LDMATRIX_X2
 // NN: A/B/C All row major
 // TN: A row major MxK, B col major NxK, C row major MxN
 // 128x128, mma2x4, warp4x4(64,32,16), stages, block swizzle, dsmem

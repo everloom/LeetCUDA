@@ -124,6 +124,8 @@ template <const int kColStride = 16, const int kStep = 8>
 static __device__ __forceinline__ int swizzle_permuted_j(int i, int j) {
   // for col_stride > 16, we have to permute it using col major ZigZag order.
   // e.g, A smem logical layout [Br,d]=[Br,64] -> store layout [4][Br][16].
+  // 当列步长（col_stride）大于 16 时，必须采用按列优先（col major）的之字形（ZigZag）顺序对其进行重排。
+  // 示例：矩阵 A 在共享内存（smem）中的逻辑布局为 [Br, d] = [Br, 64]，重排后存储布局为 [4][Br][16]。
   static_assert(kColStride <= 16, "kColStride must <= 16");
   // swizzle: ((int(j / kStep) ^ int(i / 4)) % int(kColStride / kStep)) * kStep;
   static_assert(kStep == 4 || kStep == 8, "kStep must be 8 or 4.");
@@ -171,6 +173,10 @@ static __device__ __forceinline__ int swizzle_permuted_A_j(int i, int j) {
 // stages=3, warp_tile_k=2, it will be saved as [3*2][BM][16].
 // 128x128, mma2x4, warp4x4(64,32,32), stages, block swizzle, dsmem,
 // k32 with reg double buffers
+// 为减少存储体冲突（bank conflicts），将根据 stage（阶段）维度将 K 维度（16×2=32）减半存储。例如，
+// 当 stages=3、warp_tile_k=2 时，将存储为 [3×2][BM][16] 的维度形式。
+// （涉及参数说明：）128×128（矩阵尺寸）、mma2x4（矩阵乘法累加指令格式）、warp4x4（线程束划分方式，对应尺寸 64,32,32）、stages（阶段数）、block swizzle（块重排，一种内存访问优化方式）、dsmem（设备共享内存，device shared memory 的缩写）、
+// 采用寄存器双缓冲（reg double buffers）的 32 维 K（k32）
 template <const int MMA_M = 16, const int MMA_N = 8, const int MMA_K = 16,
           const int MMA_TILE_M = 2, const int MMA_TILE_N = 4,
           const int WARP_TILE_M = 4, const int WARP_TILE_N = 4,
