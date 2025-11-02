@@ -22,6 +22,7 @@ template <const int kWarpSize = WARP_SIZE>
 __device__ __forceinline__ half warp_reduce_sum_f16(half val) {
 #pragma unroll
   for (int mask = kWarpSize >> 1; mask >= 1; mask >>= 1) {
+    // 这里的理解可以参考softmax.cu中的warp_reduce_max_f32的注释
     val += __shfl_xor_sync(0xffffffff, val, mask);
   }
   return val;
@@ -31,6 +32,7 @@ __device__ __forceinline__ half warp_reduce_sum_f16(half val) {
 // 假设K为32的倍数，每个warp负责一行
 // grid(M/4), block(32,4) blockDim.x=32=K, blockDim.y=4
 // a: MxK, x: Kx1, y: Mx1, compute: y = a * x
+// 这里以M=1024，K=128，N=1为例
 __global__ void hgemv_k32_f16_kernel(half *a, half *x, half *y, int M, int K) {
   int tx = threadIdx.x;         // 0~31
   int ty = threadIdx.y;         // 0~4
@@ -39,8 +41,18 @@ __global__ void hgemv_k32_f16_kernel(half *a, half *x, half *y, int M, int K) {
   int m = bx * blockDim.y + ty; // (0~M/4) * 4 + (0~3)
   if (m < M) {
     half sum = 0.0f;
+    // 这里是计算一行需要多少个warp来处理
     int NUM_WARPS = (K + WARP_SIZE - 1) / WARP_SIZE;
 #pragma unroll
+/*
+解释一下这里为什么要用for循环
+在这里的例子中，K=128，而在这个kernel中，一个warp负责处理一行的计算
+一行的计算的意思是，1024*128（a）和128*1（b）的乘法，结果是1024*1（c）的，一行的计算就是，a的一行和b做点积运算
+这里K=128，而warp只有32个线程，所以明显每个线程需要负责多个元素的计算，所以这里使用了for循环
+循环NUM_WARPS次，就是每个线程需要负责a中一行与b中一行的点积运算中的NUM_WARPS个元素乘法，对应int k = w * WARP_SIZE + lane和sum += a[m * K + k] * x[k]这两行
+而sum += a[m * K + k] * x[k]中的m*k的意思是行主序的offset，m是行号，而K就是行方向上的偏移，小k就是列方向上的偏移
+for循环算完之后，∑a*b的结果就汇聚到了每行第一个warp的32个线程中，然后再调用一个warp reduce sum就能在laneid 0上得到hgemv的结果
+*/
     for (int w = 0; w < NUM_WARPS; ++w) {
       // 若NUM_WARPS>=2，先将当前行的数据累加到第一个warp中
       int k = w * WARP_SIZE + lane;
@@ -56,6 +68,11 @@ __global__ void hgemv_k32_f16_kernel(half *a, half *x, half *y, int M, int K) {
 // 假设K为128的倍数 float4
 // grid(M/4), block(32,4) blockDim.x=32=K, blockDim.y=4
 // a: MxK, x: Kx1, y: Mx1, compute: y = a * x
+/*
+这个kernel没细看，看起来和hgemv_k32_f16_kernel的区别就是
+1、这里要求K是128的倍数了，不过仍然还是一个warp处理一行
+2、使用了循环展开和向量化访存
+*/
 __global__ void hgemv_k128_f16x4_kernel(half *a, half *x, half *y, int M,
                                         int K) {
   // 每个线程负责4个元素，一个warp覆盖128个元素

@@ -60,6 +60,36 @@ template <const int kWarpSize = WARP_SIZE>
 __device__ __forceinline__ float warp_reduce_max_f32(float val) {
 #pragma unroll
   for (int mask = kWarpSize >> 1; mask >= 1; mask >>= 1) {
+    /*
+     0xffffffff表示一个warp中哪些线程参与__shfl_xor_sync
+     __shfl_xor_sync的作用是，返回laneid xor mask的线程中的value值
+     这里实现取一个warp中最大值的逻辑如下
+     当mask=16时
+      Lane 0  (00000) XOR 16 (10000) = Lane 16 (10000)
+      Lane 1  (00001) XOR 16 (10000) = Lane 17 (10001)
+      Lane 15 xor 16 = Lane 31
+      ...
+      Lane 16 (10000) XOR 16 (10000) = Lane 0  (00000)
+      Lane 17 (10001) XOR 16 (10000) = Lane 1  (00001)
+      Lane 31 xor 16 = Lane 15
+      效果：
+      ┌─────────────────┬─────────────────┐
+      │  Lane 0-15      │  Lane 16-31     │
+      │  ↓↑↓↑↓↑↓↑       │  ↑↓↑↓↑↓↑↓       │
+      │  互相交换数据并取最大值            │
+      └─────────────────┴─────────────────┘
+
+    mask=8时
+    效果：
+    ┌───────┬───────┬───────┬───────┐
+    │ 0-7   │ 8-15  │ 16-23 │ 24-31 │
+    │  ↓↑   │  ↓↑   │  ↓↑   │  ↓↑   │
+    │ 每8个为一组，内部交换并取最大值 │
+    └───────┴───────┴───────┴───────┘
+
+    当mask为0时，此时每个线程中的val值就是整个warp的最大值
+
+    */
     val = fmaxf(val, __shfl_xor_sync(0xffffffff, val, mask));
   }
   return val;
