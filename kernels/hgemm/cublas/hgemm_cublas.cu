@@ -46,7 +46,11 @@ void cublas_tensor_op_nn(half *A, half *B, half *C, size_t M, size_t N,
   if (g_handle == nullptr) {
     init_cublas_handle();
   }
-
+  // NN: A/B/C All row major，TN: A row major MxK, B row major KxN, C row major MxN
+  // 这里面的参数设置如果不明白的话，就看这个链接https://blog.csdn.net/HaoBBNuanMM/article/details/103054357
+  // 传参中，第一个CUDA_R_16F表示矩阵 B 的数据类型为FP16，第二个CUDA_R_16F表示矩阵 A 的数据类型为FP16，第三个CUDA_R_16F表示矩阵 C 的数据类型为FP16
+  // CUBLAS_COMPUTE_16F 表示使用 FP16 精度进行计算
+  // CUBLAS_GEMM_DEFAULT_TENSOR_OP表示使用默认的 Tensor Core 操作
   cublasGemmEx(g_handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha, B,
                CUDA_R_16F, N, A, CUDA_R_16F, K, &beta, C, CUDA_R_16F, N,
                CUBLAS_COMPUTE_16F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
@@ -61,7 +65,8 @@ void cublas_tensor_op_tn(half *A, half *B, half *C, size_t M, size_t N,
   if (g_handle == nullptr) {
     init_cublas_handle();
   }
-
+  // 这里为什么B矩阵传的是CUBLAS_OP_T有点没弄懂，后面有时间再来理解，反正这玩意就是api咋用而已，面试大概率不问这些东西
+  // 反正我就记住对于tn，cublas就这样传参就行了
   cublasGemmEx(g_handle, CUBLAS_OP_T, CUBLAS_OP_N, N, M, K, &alpha, B,
                CUDA_R_16F, K, A, CUDA_R_16F, K, &beta, C, CUDA_R_16F, N,
                CUBLAS_COMPUTE_16F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
