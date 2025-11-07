@@ -471,6 +471,10 @@ for M, N, K in zip(Ms, Ns, Ks):
     a = A[:M, :K].contiguous()
     b = B[:K, :N].contiguous()
     c = C[:M, :N].contiguous()
+    # 这里注意一下，b经过as col major函数之后，只是行主序变成列主序了，但shape没有变
+    # 例如你解注释下面代码，会发现bb的shape和aa的shape是相同的
+    # aa = torch.randn((128, 256), dtype=torch.half, device="cuda").cuda()
+    # bb = as_col_major(aa)
     b_col_major = as_col_major(b)
     torch.cuda.synchronize()
     # CUDA Cores FP16, NN
