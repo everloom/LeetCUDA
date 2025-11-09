@@ -47,9 +47,9 @@ __global__ void hgemv_k32_f16_kernel(half *a, half *x, half *y, int M, int K) {
 /*
 解释一下这里为什么要用for循环
 在这里的例子中，K=128，而在这个kernel中，一个warp负责处理一行的计算
-一行的计算的意思是，1024*128（a）和128*1（b）的乘法，结果是1024*1（c）的，一行的计算就是，a的一行和b做点积运算
+一行的计算的意思是，1024*128（a）和128*1（b）的乘法，结果是1024*1（c）的，一行的计算就是，a的一行和b做点积运算∑ai*bi
 这里K=128，而warp只有32个线程，所以明显每个线程需要负责多个元素的计算，所以这里使用了for循环
-循环NUM_WARPS次，就是每个线程需要负责a中一行与b中一行的点积运算中的NUM_WARPS个元素乘法，对应int k = w * WARP_SIZE + lane和sum += a[m * K + k] * x[k]这两行
+循环NUM_WARPS次，就是每个线程需要负责a中一行与b中一行的点积运算中的NUM_WARPS个元素乘法(num_warps个ai*bi)，对应int k = w * WARP_SIZE + lane和sum += a[m * K + k] * x[k]这两行
 而sum += a[m * K + k] * x[k]中的m*k的意思是行主序的offset，m是行号，而K就是行方向上的偏移，小k就是列方向上的偏移
 for循环算完之后，∑a*b的结果就汇聚到了每行第一个warp的32个线程中，然后再调用一个warp reduce sum就能在laneid 0上得到hgemv的结果
 */
