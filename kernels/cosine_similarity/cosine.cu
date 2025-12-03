@@ -680,7 +680,18 @@ __global__ void __launch_bounds__(256)
         线程0收集：自己的数据 + 线程1,2,3的数据
         线程4收集：自己的数据 + 线程5,6,7的数据
       */
-
+      /*
+      // 这里i表示当前正在处理的warp负责区域中的哪一个 16 行的水平条带
+      // A的threadblock tile的大小是128*16，由于MMA_TILE_M = 2，所以实际上A的warp tile大小是64*16
+      // 同时由于WARP_TILE_M为4，所以A的warp tile被横向划分为了4个16*16的矩阵，这里的i就表示当前16*16矩阵是第几个
+      // 这里threadblock tile大小是128*128，被分成了2*4份（二维），每份64*32，相当于一共8个warp tile
+      一个warp的RC[i][j]存储了一个16*16的结果，这16*16结果在一个warp中的排布见ptx文件
+      一个warp tile的大小是64*32，这里i固定然后对j做for循环（WARP_TILE_N=4）
+      所以当j的循环结束时，相当于将一个16*32的结果放到了一个warp的RA中(B warp tile的大小是16*32,被分成了4个16*8，对应了WARP_TILE_N=4)
+      具体是这样的，一个warp有32个线程，其中只有0，4，8，12，16，20，24，28这8个线程存储了结果，以0号线程为例
+      0号线程的RA的大小是2*4*4个uint32，可以存32*2个half
+      所以一个warp中总共8个线程共存放了16*32的结果
+      */
       RA[0][j][0] = RC[i][j][0];
       RA[1][j][0] = RC[i][j][1];
       RA[0][j][1] = __shfl_sync((0xffffffff), RC[i][j][0], lane_id + 1);
@@ -698,6 +709,13 @@ __global__ void __launch_bounds__(256)
       减少内存事务数量：从32个线程写入 → 8个线程写入
     */
     if (lane_id % 4 == 0) {
+      // 这里i表示当前正在处理的warp负责区域中的哪一个 16 行的水平条带
+      // A的threadblock tile的大小是128*16，由于MMA_TILE_M = 2，所以实际上A的warp tile大小是64*16
+      // 同时由于WARP_TILE_M为4，所以A的warp tile被横向划分为了4个16*16的矩阵，这里的i就表示当前16*16矩阵是第几个
+      // 这里threadblock tile大小是128*128，被分成了2*4份（二维），每份64*32，相当于一共8个warp tile
+      // 注意这里的warp_m的定义，表示当前线程在的warp tile在整个threadblock tile中的行偏移
+      // warp_m * (MMA_M * WARP_TILE_M)就表示当前线程所在位置在A threadblock tile中的行偏移 warp_m * ( 16 * 4 )
+      // 而i * MMA_M则表示在A warp tile中的行偏移，i * 16
       int store_warp_smem_c_m = warp_m * (MMA_M * WARP_TILE_M) + i * MMA_M;
       int store_lane_gmem_c_m = by * BM + store_warp_smem_c_m + lane_id / 4;
 #pragma unroll
