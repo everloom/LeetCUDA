@@ -178,8 +178,6 @@ __global__ void __launch_bounds__(256)
 
   half *s_a = smem;
   half *s_b = smem + K_STAGE * BM * (BK + A_PAD) * WARP_TILE_K;
-  half *s_a_norm = smem + K_STAGE * BM * (BK + A_PAD) * WARP_TILE_K + BM;
-  half *s_b_norm = smem + K_STAGE * BM * (BK + A_PAD) * WARP_TILE_K + BM + BN;
 
   constexpr int s_a_stage_offset = BM * (BK + A_PAD); // 128x16
   constexpr int s_b_stage_offset = BK * (BN + B_PAD); // 16x128
@@ -297,9 +295,24 @@ __global__ void __launch_bounds__(256)
   __syncthreads();
 
   // 这里因为使用了tile内流水（32的大k tile分成了两个16的小k tile），所以需要的RA和RB寄存器翻倍了
+  // 问了下gemini 3pro，说这里RA中寄存器不是连续的，除非代码中有ldmatrix和lds128这种需要RA中数据是连续的指令，编译器才会将RA的寄存器分配为连续的
   uint32_t RA[2][WARP_TILE_M][4];
   uint32_t RB[2][WARP_TILE_N][2];
 
+  // 说一下这里ra_norm和rb_norm的shape的问题
+  // 因为对于m16n8k16的mma来说，对于A矩阵，每个thread的RA寄存器的数据分布在两行，所以这里ra_norm的shape的2就对应了两行
+  // 对于B矩阵，每个thread的RB寄存器的数据分布在一列，所以
+  float RA_NORM[WARP_TILE_M][2];
+  float RB_NORM[WARP_TILE_N];
+  for(int i = 0; i < WARP_TILE_M; ++i) {
+    RA_NORM[i][0] = 0.0f;
+    RA_NORM[i][1] = 0.0f;
+  }
+
+  for(int i = 0; i < WARP_TILE_N; ++i) {
+    RB_NORM[i] = 0.0f;
+  }
+  
   // 这两个参数用于控制tile内流水，因为使用的双缓冲，即大k tile分成了两个小k tile
   // 所以这里用了两个变量控制寄存器
   int reg_store_idx = 0;
@@ -464,6 +477,37 @@ __global__ void __launch_bounds__(256)
                   RB[reg_load_idx][j_s][1], RC[i][j_s][0], RC[i][j_s][1]);
       }
     }
+#pragma unroll
+    for (int i = 0; i < WARP_TILE_M; ++i) {
+        // [FIX] Extract 2 halfs from uint32, convert to float, compute sum of squares
+        // RA[...] is uint32_t, holding 2 packed halfs.
+        // 1. Reinterpret uint32_t as half2
+        half2 val_h2 = reinterpret_cast<half2&>(RA[reg_load_idx][i][0]);
+        // 2. Convert half2 to float2 to avoid overflow during square
+        float2 val_f2 = __half22float2(val_h2);
+        // 3. Accumulate a^2 + b^2
+        RA_NORM[i][0] = __fmaf_rn(val_f2.x, val_f2.x, RA_NORM[i][0]);
+        RA_NORM[i][0] = __fmaf_rn(val_f2.y, val_f2.y, RA_NORM[i][0]);
+
+        // 2. Process RA[...][2] -> Accumulate to RA_NORM[i][0]
+        val_h2 = reinterpret_cast<half2&>(RA[reg_load_idx][i][2]);
+        val_f2 = __half22float2(val_h2);
+        RA_NORM[i][0] = __fmaf_rn(val_f2.x, val_f2.x, RA_NORM[i][0]);
+        RA_NORM[i][0] = __fmaf_rn(val_f2.y, val_f2.y, RA_NORM[i][0]);
+
+        // 3. Process RA[...][1] -> Accumulate to RA_NORM[i][1]
+        val_h2 = reinterpret_cast<half2&>(RA[reg_load_idx][i][1]);
+        val_f2 = __half22float2(val_h2);
+        RA_NORM[i][1] = __fmaf_rn(val_f2.x, val_f2.x, RA_NORM[i][1]);
+        RA_NORM[i][1] = __fmaf_rn(val_f2.y, val_f2.y, RA_NORM[i][1]);
+
+        // 4. Process RA[...][3] -> Accumulate to RA_NORM[i][1]
+        val_h2 = reinterpret_cast<half2&>(RA[reg_load_idx][i][3]);
+        val_f2 = __half22float2(val_h2);
+        RA_NORM[i][1] = __fmaf_rn(val_f2.x, val_f2.x, RA_NORM[i][1]);
+        RA_NORM[i][1] = __fmaf_rn(val_f2.y, val_f2.y, RA_NORM[i][1]);
+    }
+
 
     reg_store_idx ^= 1; // 1 -> 0
     reg_load_idx ^= 1;  // 0 -> 1
@@ -534,6 +578,8 @@ __global__ void __launch_bounds__(256)
   }
 
   // make sure all memory issues ready.
+  // 这里判断(K_STAGE - 2) > 0是因为，当k_stage > 2时会出现mainloop完了，但还有cp async在执行的情况
+  // 所以这里需要针对k_stage > 2的情况执行一次wait
   if constexpr ((K_STAGE - 2) > 0) {
     CP_ASYNC_WAIT_GROUP(0);
     __syncthreads();
@@ -683,15 +729,26 @@ __global__ void __launch_bounds__(256)
       /*
       // 这里i表示当前正在处理的warp负责区域中的哪一个 16 行的水平条带
       // A的threadblock tile的大小是128*16，由于MMA_TILE_M = 2，所以实际上A的warp tile大小是64*16
+      // B的threadblock tile大小是16*128，由于MMA_TILE_N = 4，所以实际上B的warp tile大小是16*32
       // 同时由于WARP_TILE_M为4，所以A的warp tile被横向划分为了4个16*16的矩阵，这里的i就表示当前16*16矩阵是第几个
+      // WARP_TILE_N为4，所以B的warp tile被纵向划分为了4个16*8的矩阵
       // 这里threadblock tile大小是128*128，被分成了2*4份（二维），每份64*32，相当于一共8个warp tile
-      一个warp的RC[i][j]存储了一个16*16的结果，这16*16结果在一个warp中的排布见ptx文件
+      一个warp的RC[i][j]存储了一个16*8的结果，这16*8结果在一个warp中的排布见ptx文件
       一个warp tile的大小是64*32，这里i固定然后对j做for循环（WARP_TILE_N=4）
       所以当j的循环结束时，相当于将一个16*32的结果放到了一个warp的RA中(B warp tile的大小是16*32,被分成了4个16*8，对应了WARP_TILE_N=4)
       具体是这样的，一个warp有32个线程，其中只有0，4，8，12，16，20，24，28这8个线程存储了结果，以0号线程为例
       0号线程的RA的大小是2*4*4个uint32，可以存32*2个half
       所以一个warp中总共8个线程共存放了16*32的结果
       */
+     /*
+     上面说一，一个warp中总共8个线程共存放了16*32的结果，但那是j的for循环执行完毕的情况
+     这里只以j=0为例进行讲解，当j固定为某个值时，一个warp中所有RA[:][j][:]中存储了一个16*8的结果
+     然后由于warp shuffle，16*8的结果被存放在了0，4，8，12，16，20，24，28这8个线程中
+     这里以0号线程为例，0号线程的RA实际上存储了16*8矩阵的第0行和第8行的结果，4号线程RA存放了第1行和第9行的结果，第28号线程存放了第7行和第15行的结果
+    具体的，以0号线程为例，RA[0][j][0,1,2,3]存放了第0行的8个half结果，RA[1][j][0,1,2,3]存放了第8行的8个half结果
+    对于第4号线程，RA[0][j][0,1,2,3]存放了第1行的8个half结果，RA[1][j][0,1,2,3]存放了第9行的8个half结果
+    上面的解释，你直接看大概率看不懂，强烈建议自己画一下这个gemm的layout层次图，然后对着ptx文档的那个矩阵结果在寄存器中的分布图来理解
+     */
       RA[0][j][0] = RC[i][j][0];
       RA[1][j][0] = RC[i][j][1];
       RA[0][j][1] = __shfl_sync((0xffffffff), RC[i][j][0], lane_id + 1);
@@ -711,20 +768,38 @@ __global__ void __launch_bounds__(256)
     if (lane_id % 4 == 0) {
       // 这里i表示当前正在处理的warp负责区域中的哪一个 16 行的水平条带
       // A的threadblock tile的大小是128*16，由于MMA_TILE_M = 2，所以实际上A的warp tile大小是64*16
+      // B的threadblock tile大小是16*128，由于MMA_TILE_N = 4，所以实际上B的warp tile大小是16*32
       // 同时由于WARP_TILE_M为4，所以A的warp tile被横向划分为了4个16*16的矩阵，这里的i就表示当前16*16矩阵是第几个
+      // WARP_TILE_N为4，所以B的warp tile被纵向划分为了4个16*8的矩阵
       // 这里threadblock tile大小是128*128，被分成了2*4份（二维），每份64*32，相当于一共8个warp tile
       // 注意这里的warp_m的定义，表示当前线程在的warp tile在整个threadblock tile中的行偏移
       // warp_m * (MMA_M * WARP_TILE_M)就表示当前线程所在位置在A threadblock tile中的行偏移 warp_m * ( 16 * 4 )
       // 而i * MMA_M则表示在A warp tile中的行偏移，i * 16
       int store_warp_smem_c_m = warp_m * (MMA_M * WARP_TILE_M) + i * MMA_M;
+      // 这里by * BM是全局的行号偏移，store_warp_smem_c_m是A的warp tile级别的行偏移
+      // lane_id / 4是线程级别的行偏移
+      // 上面说过了，对于固定j的情况下，一个warp中的RA[0][j][0,1,2,3]和RA[1][j][0,1,2,3]就存放了一个16*8的结果
+      // 同时lane_id中RA[0][j][0,1,2,3]和RA[1][j][0,1,2,3]存放的是矩阵哪一行的结果这样的对应关系
+      // 对于RA[0][j][0,1,2,3]的结果，对应的矩阵行号是lane_id / 4
+      // 对于RA[1][j][0,1,2,3]的结果，对应的矩阵行号是lane_id / 4 + 8
       int store_lane_gmem_c_m = by * BM + store_warp_smem_c_m + lane_id / 4;
 #pragma unroll
       for (int j = 0; j < WARP_TILE_N; ++j) {
+        // warp_n表示当前线程在的warp tile在整个threadblock tile中的列偏移(0, 1, 2, 3)
+        // warp_n * (MMA_N * WARP_TILE_N)就是B threadblock tile级别的列偏移 warp_n * (8 * 4)
+        // j * MMA_N则表示在B warp tile中的列偏移 j * 8
         int store_warp_smem_c_n = warp_n * (MMA_N * WARP_TILE_N) + j * MMA_N;
+        // bx * BN是全局级别的列偏移
+        // 注意这里列偏移之所以不像计算store_lane_gmem_c_m那样需要线程级别的偏移(lane_id / 4)
+        // 是因为这里列偏移实际上只要到mma tile级别的偏移就够了
+        // 具体的需要你把gemm 的layout画出来仔细理解一下才行
         int store_lane_gmem_c_n = bx * BN + store_warp_smem_c_n;
+
         int store_gmem_c_addr_0 = store_lane_gmem_c_m * N + store_lane_gmem_c_n;
+        // 这里(store_lane_gmem_c_m + 8)好理解，上面store_lane_gmem_c_m的注释中已经结束了
         int store_gmem_c_addr_1 =
             (store_lane_gmem_c_m + 8) * N + store_lane_gmem_c_n;
+        // gemini 3pro说，使用LDST128BITS，需要等号两边都使用才行
         LDST128BITS(C[store_gmem_c_addr_0]) = LDST128BITS(RA[0][j][0]);
         LDST128BITS(C[store_gmem_c_addr_1]) = LDST128BITS(RA[1][j][0]);
       }
