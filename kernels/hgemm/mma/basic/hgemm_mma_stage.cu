@@ -749,6 +749,8 @@ __global__ void __launch_bounds__(256)
     int load_gmem_b_k = k * BK * WARP_TILE_K + load_smem_b_k; // global row of b
     int load_gmem_b_addr = load_gmem_b_k * N + load_gmem_b_n;
 
+    // 可以看到这里关于a矩阵加载了两次，是因为k维度翻倍变成了32
+    // 但这里将32的k拆成了两个16，所以进行了两次加载，第一次加载前16的k，第二次加载后16的k
     /*
     这里说一下为什么预加载K_STAGE-1个gmem的数据
     参考reed大佬的讲解multistage的博客https://zhuanlan.zhihu.com/p/665082713
