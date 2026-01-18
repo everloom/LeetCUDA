@@ -1,0 +1,1 @@
+nvcc -O3 -std=c++17 -arch=sm_80 -I. cosine_similarity_v4.cu -o cosine_similarity_v4 -lcublas
