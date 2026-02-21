@@ -153,7 +153,7 @@ __global__ void __launch_bounds__(128)
     // 这里注意下，虽然这里有s_b_stage_offset这个变量，但实际上b是不分stage的
     // 因为stage一般指的多级流水，但这里b是没有多级流水的
     // 这里有s_b_stage_offset这个变量的存在只是为了mainloop中ldmatrix时方便而已
-    const int s_a_stage_offset = MMA_M  * MMA_TILE_M * (INNER_DIM + A_PAD);
+    const int s_a_stage_offset = MMA_M  * MMA_TILE_M * (MMA_K + A_PAD);
     const int tid = threadIdx.y * blockDim.x + threadIdx.x;
     const int warp_id = tid / WARP_SIZE;
     const int lane_id = tid % WARP_SIZE;
@@ -507,7 +507,7 @@ void launch_cosine_kernel_tn(half *a, half *b, half *c, int M, int N, int K)
     // const int smem_max_size = ((K_STAGE)*BM * (BK + A_PAD) * sizeof(half) +
     //                            (K_STAGE)*BN * (BK + B_PAD) * sizeof(half));
     const int smem_max_size = MMA_N * INNER_DIM * sizeof(half) + 
-                            K_STAGE * MMA_M * MMA_TILE_M * INNER_DIM * sizeof(half);
+                            K_STAGE * MMA_M * MMA_TILE_M * MMA_K * sizeof(half);
     // cudaFuncSetAttribute的作用是告诉 CUDA 运行时（Runtime），这个 Kernel 函数需要使用超过默认限制（通常是 48KB）的动态共享内存，具体上限设为 98304 字节（即 96KB）。
     // 如果不加上这句话，而kernel使用的smem总数超过48kb，就会报错
     /*
@@ -537,7 +537,7 @@ int main(int argc, char *argv[])
     int N_list[test_num];
     int K_list[test_num];
 
-    M_list[0] = 250000;
+    M_list[0] = 249984;
     N_list[0] = 8;
     K_list[0] = 128;
 
