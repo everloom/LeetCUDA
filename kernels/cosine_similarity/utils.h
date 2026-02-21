@@ -147,8 +147,8 @@ float gemm_error_check_tn(void (*gpu_hgemm)(T *, T *, T *, int, int, int),
 
   cublasHandle_t handle;
   cublasCreate(&handle);
-  half alpha = 1.f;
-  half beta = 0.f;
+  half alpha = __float2half(1.f);
+  half beta = __float2half(0.f);
 
   cudaMemcpy(d_a, h_a, size_a, cudaMemcpyHostToDevice);
   cudaMemcpy(d_b, h_b, size_b, cudaMemcpyHostToDevice);
@@ -209,8 +209,8 @@ float gemm_error_check_tn_swizzle(void (*gpu_hgemm)(T *, T *, T *, int, int,
 
   cublasHandle_t handle;
   cublasCreate(&handle);
-  half alpha = 1.f;
-  half beta = 0.f;
+  half alpha = __float2half(1.f);
+  half beta = __float2half(0.f);
 
   cudaMemcpy(d_a, h_a, size_a, cudaMemcpyHostToDevice);
   cudaMemcpy(d_b, h_b, size_b, cudaMemcpyHostToDevice);
@@ -271,8 +271,8 @@ float gemm_error_check_nn(void (*gpu_hgemm)(T *, T *, T *, int, int, int),
   cublasHandle_t handle;
   cublasCreate(&handle);
   cublasSetMathMode(handle, CUBLAS_TENSOR_OP_MATH);
-  half alpha = 1.f;
-  half beta = 0.f;
+  half alpha = __float2half(1.f);
+  half beta = __float2half(0.f);
 
   cudaMemcpy(d_a, h_a, size_a, cudaMemcpyHostToDevice);
   cudaMemcpy(d_b, h_b, size_b, cudaMemcpyHostToDevice);
